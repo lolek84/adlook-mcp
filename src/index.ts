@@ -345,49 +345,29 @@ server.tool(
 
 server.tool(
   "run_report_preview",
-  "Tworzy podgląd raportu i czeka (polling) aż zadanie osiągnie status SUCCEEDED lub FAILED. " +
-    "Łączy create_report_preview + get_report_preview w jednym wywołaniu. " +
-    "Parametry poll_interval_ms i poll_timeout_ms kontrolują częstotliwość i maksymalny czas oczekiwania.",
-  {
-    ...ReportRequestSchema,
-    poll_interval_ms: z
-      .number()
-      .int()
-      .min(500)
-      .optional()
-      .describe(`Interval pollingu w ms (domyślnie ${DEFAULT_POLL_INTERVAL_MS})`),
-    poll_timeout_ms: z
-      .number()
-      .int()
-      .min(1000)
-      .optional()
-      .describe(`Maksymalny czas oczekiwania w ms (domyślnie ${DEFAULT_POLL_TIMEOUT_MS})`),
-  },
-  async ({ poll_interval_ms, poll_timeout_ms, ...reportArgs }) => {
+  "Tworzy zadanie raportu (POST) i natychmiast zwraca UUID — BEZ CZEKANIA na wynik. " +
+    "Następnie wywołuj get_report_preview z tym UUID co kilka sekund, " +
+    "aż status zmieni się na SUCCEEDED lub FAILED. " +
+    "Takie podejście jest wymagane ze względu na limity timeoutu serwera.",
+  ReportRequestSchema,
+  async (reportArgs) => {
     try {
-      // 1. Utwórz zadanie
       const created = (await apiPost(
         "/custom-reports/previews",
         reportArgs
       )) as { uuid: string };
 
-      const uuid = created.uuid;
-
-      // 2. Polling
-      const preview = await pollUntilDone(
-        uuid,
-        poll_interval_ms ?? DEFAULT_POLL_INTERVAL_MS,
-        poll_timeout_ms ?? DEFAULT_POLL_TIMEOUT_MS
-      );
-
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ uuid, ...preview }, null, 2),
+            text: JSON.stringify({
+              uuid: created.uuid,
+              status: "PENDING",
+              message: "Zadanie zostało utworzone. Wywołaj get_report_preview z tym UUID za 5-10 sekund aby sprawdzić wynik. Powtarzaj aż status będzie SUCCEEDED lub FAILED.",
+            }, null, 2),
           },
         ],
-        isError: preview.status === "FAILED",
       };
     } catch (err) {
       return {
