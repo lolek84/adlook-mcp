@@ -275,10 +275,11 @@ async function pollUntilDone(
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({
-  name: "adlook-custom-reports",
-  version: "1.0.0",
-});
+function createServer(): McpServer {
+  const server = new McpServer({
+    name: "adlook-custom-reports",
+    version: "1.0.0",
+  });
 
 // ── Narzędzie 1: create_report_preview ───────────────────────────────────────
 
@@ -485,6 +486,9 @@ server.resource(
   })
 );
 
+  return server;
+}
+
 // ── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.PORT ?? "3000");
@@ -492,6 +496,7 @@ const MODE = process.env.MCP_TRANSPORT ?? "http"; // "http" | "stdio"
 
 if (MODE === "stdio") {
   // Lokalny tryb stdio (np. testowanie z terminala)
+  const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 } else {
@@ -525,7 +530,8 @@ if (MODE === "stdio") {
         if (id) sessions.delete(id);
       };
 
-      await server.connect(transport);
+      const sessionServer = createServer();
+      await sessionServer.connect(transport);
     }
 
     await transport.handleRequest(req, res, req.body);
