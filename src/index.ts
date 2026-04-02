@@ -513,48 +513,90 @@ if (MODE === "stdio") {
 
     let transport: StreamableHTTPServerTransport;
 
-    if (sessionId && sessions.has(sessionId)) {
-      // Istniejąca sesja
-      transport = sessions.get(sessionId)!;
-    } else {
-      // Nowa sesja
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (id) => {
-          sessions.set(id, transport);
-        },
-      });
+    try {
+      if (sessionId && sessions.has(sessionId)) {
+        // Istniejąca sesja
+        transport = sessions.get(sessionId)!;
+      } else {
+        // Nowa sesja
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (id) => {
+            console.log(`[MCP] Nowa sesja: ${id}`);
+            sessions.set(id, transport);
+          },
+        });
 
-      transport.onclose = () => {
-        const id = (transport as any).sessionId;
-        if (id) sessions.delete(id);
-      };
+        transport.onclose = () => {
+          const id = (transport as any).sessionId;
+          if (id) {
+            console.log(`[MCP] Sesja zamknięta: ${id}`);
+            sessions.delete(id);
+          }
+        };
 
-      const sessionServer = createServer();
-      await sessionServer.connect(transport);
+        const sessionServer = createServer();
+        await sessionServer.connect(transport);
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[MCP] Błąd POST /mcp (sesja: ${sessionId ?? "nowa"}): ${message}`);
+      if (!res.headersSent) {
+        res.status(500).json({ error: message });
+      }
     }
-
-    await transport.handleRequest(req, res, req.body);
   });
 
   // SSE dla powiadomień serwera → klient
   app.get("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     if (!sessionId || !sessions.has(sessionId)) {
+      console.warn(`[MCP] GET /mcp — nieznany sessionId: ${sessionId}`);
       res.status(400).json({ error: "Brak lub nieznany mcp-session-id" });
       return;
     }
-    const transport = sessions.get(sessionId)!;
-    await transport.handleRequest(req, res);
+    try {
+      const transport = sessions.get(sessionId)!;
+      await transport.handleRequest(req, res);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[MCP] Błąd GET /mcp (sesja: ${sessionId}): ${message}`);
+      if (!res.headersSent) {
+        res.status(500).json({ error: message });
+      }
+    }
   });
 
   // Health check
   app.get("/health", (_req, res) => {
-    res.json({ status: "ok", server: "adlook-custom-reports", version: "1.0.0" });
+    res.json({
+      status: "ok",
+      server: "adlook-custom-reports",
+      version: "1.0.0",
+      sessions: sessions.size,
+      uptime: Math.floor(process.uptime()),
+    });
+  });
+
+  // Global error handler
+  app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error(`[MCP] Nieobsłużony błąd: ${err.message}`, err.stack);
+    res.status(500).json({ error: err.message });
+  });
+
+  process.on("uncaughtException", (err) => {
+    console.error(`[MCP] uncaughtException: ${err.message}`, err.stack);
+  });
+
+  process.on("unhandledRejection", (reason) => {
+    console.error(`[MCP] unhandledRejection:`, reason);
   });
 
   app.listen(PORT, () => {
     console.log(`Adlook MCP Server uruchomiony na porcie ${PORT}`);
     console.log(`Endpoint MCP: http://localhost:${PORT}/mcp`);
+    console.log(`Health check: http://localhost:${PORT}/health`);
   });
 }
