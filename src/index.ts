@@ -12,6 +12,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import express from "express";
 import { randomUUID } from "crypto";
@@ -504,68 +505,48 @@ if (MODE === "stdio") {
   const app = express();
   app.use(express.json());
 
-  // Mapa sesji: sessionId → transport
-  const sessions = new Map<string, StreamableHTTPServerTransport>();
+  // Mapa sesji SSE: sessionId → transport
+  const sseSessions = new Map<string, SSEServerTransport>();
 
-  // Endpoint MCP (Streamable HTTP)
-  app.post("/mcp", async (req, res) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-    let transport: StreamableHTTPServerTransport;
-
+  // SSE endpoint — klient łączy się tutaj i trzyma połączenie otwarte
+  app.get("/sse", async (req, res) => {
+    console.log("[MCP] Nowe połączenie SSE");
     try {
-      if (sessionId && sessions.has(sessionId)) {
-        // Istniejąca sesja
-        transport = sessions.get(sessionId)!;
-      } else {
-        // Nowa sesja
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (id) => {
-            console.log(`[MCP] Nowa sesja: ${id}`);
-            sessions.set(id, transport);
-          },
-        });
+      const transport = new SSEServerTransport("/message", res);
+      sseSessions.set(transport.sessionId, transport);
+      console.log(`[MCP] Sesja SSE: ${transport.sessionId}`);
 
-        transport.onclose = () => {
-          const id = (transport as any).sessionId;
-          if (id) {
-            console.log(`[MCP] Sesja zamknięta: ${id}`);
-            sessions.delete(id);
-          }
-        };
+      transport.onclose = () => {
+        console.log(`[MCP] Sesja SSE zamknięta: ${transport.sessionId}`);
+        sseSessions.delete(transport.sessionId);
+      };
 
-        const sessionServer = createServer();
-        await sessionServer.connect(transport);
-      }
-
-      await transport.handleRequest(req, res, req.body);
+      const sessionServer = createServer();
+      await sessionServer.connect(transport);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`[MCP] Błąd POST /mcp (sesja: ${sessionId ?? "nowa"}): ${message}`);
-      if (!res.headersSent) {
-        res.status(500).json({ error: message });
-      }
+      console.error(`[MCP] Błąd SSE: ${message}`);
+      if (!res.headersSent) res.status(500).end();
     }
   });
 
-  // SSE dla powiadomień serwera → klient
-  app.get("/mcp", async (req, res) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId || !sessions.has(sessionId)) {
-      console.warn(`[MCP] GET /mcp — nieznany sessionId: ${sessionId}`);
-      res.status(400).json({ error: "Brak lub nieznany mcp-session-id" });
+  // Message endpoint — klient wysyła wiadomości tutaj
+  app.post("/message", async (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    const transport = sseSessions.get(sessionId);
+
+    if (!transport) {
+      console.warn(`[MCP] Nieznany sessionId: ${sessionId}`);
+      res.status(400).json({ error: `Nieznana sesja: ${sessionId}` });
       return;
     }
+
     try {
-      const transport = sessions.get(sessionId)!;
-      await transport.handleRequest(req, res);
+      await transport.handlePostMessage(req, res);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`[MCP] Błąd GET /mcp (sesja: ${sessionId}): ${message}`);
-      if (!res.headersSent) {
-        res.status(500).json({ error: message });
-      }
+      console.error(`[MCP] Błąd /message (sesja: ${sessionId}): ${message}`);
+      if (!res.headersSent) res.status(500).json({ error: message });
     }
   });
 
@@ -575,7 +556,7 @@ if (MODE === "stdio") {
       status: "ok",
       server: "adlook-custom-reports",
       version: "1.0.0",
-      sessions: sessions.size,
+      sessions: sseSessions.size,
       uptime: Math.floor(process.uptime()),
     });
   });
@@ -596,7 +577,7 @@ if (MODE === "stdio") {
 
   app.listen(PORT, () => {
     console.log(`Adlook MCP Server uruchomiony na porcie ${PORT}`);
-    console.log(`Endpoint MCP: http://localhost:${PORT}/mcp`);
+    console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
     console.log(`Health check: http://localhost:${PORT}/health`);
   });
 }
