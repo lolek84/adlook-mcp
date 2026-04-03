@@ -19,8 +19,8 @@ const TOKEN_URL =
 
 const REFRESH_MODE = (process.env.ADLOOK_TOKEN_REFRESH_MODE ?? "json").toLowerCase();
 
-/** Pole JSON z refresh tokenem w body (np. refreshToken albo refresh_token). */
-const REFRESH_JSON_FIELD = process.env.ADLOOK_REFRESH_TOKEN_JSON_FIELD ?? "refreshToken";
+/** Pole JSON z refresh tokenem w body (Adlook Smart API: `refresh`). */
+const REFRESH_JSON_FIELD = process.env.ADLOOK_REFRESH_TOKEN_JSON_FIELD ?? "refresh";
 
 const CLIENT_ID = process.env.ADLOOK_OAUTH_CLIENT_ID?.trim() ?? "";
 const CLIENT_SECRET = process.env.ADLOOK_OAUTH_CLIENT_SECRET?.trim() ?? "";
@@ -72,12 +72,12 @@ export function setSessionAuth(accessToken: string, refreshToken?: string): void
 }
 
 function pickAccessToken(data: Record<string, unknown>): string | null {
-  const a = data.accessToken ?? data.access_token ?? data.token;
+  const a = data.access ?? data.accessToken ?? data.access_token ?? data.token;
   return typeof a === "string" && a.length > 0 ? a : null;
 }
 
 function pickRefreshToken(data: Record<string, unknown>): string | null {
-  const r = data.refreshToken ?? data.refresh_token;
+  const r = data.refresh ?? data.refreshToken ?? data.refresh_token;
   return typeof r === "string" && r.length > 0 ? r : null;
 }
 
