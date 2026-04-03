@@ -4,6 +4,7 @@
  * MCP Server
  *
  * Narzędzia:
+ *   set_adlook_auth        – tokeny z przeglądarki na sesję (pamięć procesu)
  *   create_report_preview  – POST /api/custom-reports/previews
  *   get_report_preview     – GET  /api/custom-reports/previews/{uuid}
  *   run_report_preview     – POST + polling GET aż do SUCCEEDED / FAILED
@@ -16,11 +17,16 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import express from "express";
 import { randomUUID } from "crypto";
+import {
+  invalidateCachedAccessToken,
+  isOAuthRefreshConfigured,
+  resolveAccessToken,
+  setSessionAuth,
+} from "./access-token.js";
 
 // ── Stałe ────────────────────────────────────────────────────────────────────
 
 const BASE_URL = process.env.ADLOOK_BASE_URL ?? "https://api.uat.smart.adlook.com/api";
-const BEARER_TOKEN = process.env.ADLOOK_TOKEN ?? "";
 
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_POLL_TIMEOUT_MS = 120_000;
@@ -202,50 +208,71 @@ const ReportRequestSchema = {
 
 // ── Pomocniki HTTP ────────────────────────────────────────────────────────────
 
-function authHeaders(tokenOverride?: string): Record<string, string> {
-  const token = tokenOverride?.trim() || BEARER_TOKEN;
-  if (!token) {
-    throw new Error(
-      "Brak tokenu autoryzacyjnego. Podaj adlook_token w argumencie narzędzia lub ustaw ADLOOK_TOKEN w env."
-    );
-  }
+function bearerJsonHeaders(accessToken: string): Record<string, string> {
   return {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${token}`,
+    Authorization: `Bearer ${accessToken}`,
   };
 }
 
+/** Jedno ponowienie przy 401, gdy używany jest token z env + skonfigurowany OAuth refresh. */
 async function apiPost(path: string, body: unknown, tokenOverride?: string): Promise<unknown> {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    method: "POST",
-    headers: authHeaders(tokenOverride),
-    body: JSON.stringify(body),
-  });
+  const tryPost = async (isRetry: boolean): Promise<unknown> => {
+    const token = await resolveAccessToken(tokenOverride);
+    const res = await fetch(`${BASE_URL}${path}`, {
+      method: "POST",
+      headers: bearerJsonHeaders(token),
+      body: JSON.stringify(body),
+    });
 
-  const data = await res.json();
+    const data = await res.json();
 
-  if (!res.ok) {
-    throw new Error(
-      `HTTP ${res.status}: ${JSON.stringify(data)}`
-    );
-  }
-  return data;
+    if (
+      res.status === 401 &&
+      !isRetry &&
+      !tokenOverride?.trim() &&
+      isOAuthRefreshConfigured()
+    ) {
+      invalidateCachedAccessToken();
+      return tryPost(true);
+    }
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${JSON.stringify(data)}`);
+    }
+    return data;
+  };
+
+  return tryPost(false);
 }
 
 async function apiGet(path: string, tokenOverride?: string): Promise<unknown> {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    method: "GET",
-    headers: authHeaders(tokenOverride),
-  });
+  const tryGet = async (isRetry: boolean): Promise<unknown> => {
+    const token = await resolveAccessToken(tokenOverride);
+    const res = await fetch(`${BASE_URL}${path}`, {
+      method: "GET",
+      headers: bearerJsonHeaders(token),
+    });
 
-  const data = await res.json();
+    const data = await res.json();
 
-  if (!res.ok) {
-    throw new Error(
-      `HTTP ${res.status}: ${JSON.stringify(data)}`
-    );
-  }
-  return data;
+    if (
+      res.status === 401 &&
+      !isRetry &&
+      !tokenOverride?.trim() &&
+      isOAuthRefreshConfigured()
+    ) {
+      invalidateCachedAccessToken();
+      return tryGet(true);
+    }
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${JSON.stringify(data)}`);
+    }
+    return data;
+  };
+
+  return tryGet(false);
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────
@@ -290,6 +317,57 @@ function createServer(): McpServer {
     name: "adlook-custom-reports",
     version: "1.0.0",
   });
+
+// ── Narzędzie: set_adlook_auth (sesja) ───────────────────────────────────────
+
+server.tool(
+  "set_adlook_auth",
+  "Na początku sesji: zapisuje tokeny skopiowane z przeglądarki (tylko w pamięci tego procesu MCP). " +
+    "access_token — JWT z nagłówka Authorization (same znaki po 'Bearer ') albo z Application → Local Storage. " +
+    "refresh_token — z odpowiedzi żądania logowania (Network) lub innego źródła; bez niego serwer nie może sam odświeżać access tokenu. " +
+    "Po ustawieniu pozostałe narzędzia używają tych tokenów zamiast ADLOOK_TOKEN z env.",
+  {
+    access_token: z
+      .string()
+      .min(1)
+      .describe("Access token (JWT) z przeglądarki"),
+    refresh_token: z
+      .string()
+      .optional()
+      .describe(
+        "Refresh token — wymagany do automatycznego odświeżania; bez tego działa tylko do wygaśnięcia access tokenu"
+      ),
+  },
+  async ({ access_token, refresh_token }) => {
+    try {
+      setSessionAuth(access_token, refresh_token);
+      const canRefresh = isOAuthRefreshConfigured();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: true,
+                auto_refresh: canRefresh,
+                message: canRefresh
+                  ? "Tokeny zapisane. MCP będzie odświeżać access token przez POST .../auth/token/refresh."
+                  : "Zapisano tylko access token. Dodaj refresh_token (albo ADLOOK_REFRESH_TOKEN w env), żeby działało automatyczne odświeżanie.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Błąd: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
 
 // ── Narzędzie 1: create_report_preview ───────────────────────────────────────
 
