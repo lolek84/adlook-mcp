@@ -483,7 +483,8 @@ if (MODE === "stdio") {
 } else {
   // Tryb HTTP/SSE dla deploymentu zespołowego
   const app = express();
-  app.use(express.json());
+  // Uwaga: NIE podpinamy globalnego parsera JSON.
+  // MCP transport potrzebuje surowego strumienia requestu na /message.
 
   // Mapa sesji SSE: sessionId → transport
   const sseSessions = new Map<string, SSEServerTransport>();
