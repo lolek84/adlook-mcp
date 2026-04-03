@@ -193,26 +193,32 @@ const ReportRequestSchema = {
     .array(FilterSchema)
     .optional()
     .describe("Opcjonalne filtry (ADVERTISER_UUID / CLIENT_UUID)"),
+  adlook_token: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("Opcjonalny token Bearer do Adlook API. Jeśli nie podasz, użyty będzie ADLOOK_TOKEN z env."),
 };
 
 // ── Pomocniki HTTP ────────────────────────────────────────────────────────────
 
-function authHeaders(): Record<string, string> {
-  if (!BEARER_TOKEN) {
+function authHeaders(tokenOverride?: string): Record<string, string> {
+  const token = tokenOverride?.trim() || BEARER_TOKEN;
+  if (!token) {
     throw new Error(
-      "Brak tokenu autoryzacyjnego. Ustaw zmienną środowiskową ADLOOK_TOKEN."
+      "Brak tokenu autoryzacyjnego. Podaj adlook_token w argumencie narzędzia lub ustaw ADLOOK_TOKEN w env."
     );
   }
   return {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${BEARER_TOKEN}`,
+    Authorization: `Bearer ${token}`,
   };
 }
 
-async function apiPost(path: string, body: unknown): Promise<unknown> {
+async function apiPost(path: string, body: unknown, tokenOverride?: string): Promise<unknown> {
   const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
-    headers: authHeaders(),
+    headers: authHeaders(tokenOverride),
     body: JSON.stringify(body),
   });
 
@@ -226,10 +232,10 @@ async function apiPost(path: string, body: unknown): Promise<unknown> {
   return data;
 }
 
-async function apiGet(path: string): Promise<unknown> {
+async function apiGet(path: string, tokenOverride?: string): Promise<unknown> {
   const res = await fetch(`${BASE_URL}${path}`, {
     method: "GET",
-    headers: authHeaders(),
+    headers: authHeaders(tokenOverride),
   });
 
   const data = await res.json();
@@ -252,6 +258,7 @@ interface ReportPreview {
 
 async function pollUntilDone(
   uuid: string,
+  tokenOverride?: string,
   intervalMs = DEFAULT_POLL_INTERVAL_MS,
   timeoutMs = DEFAULT_POLL_TIMEOUT_MS
 ): Promise<ReportPreview> {
@@ -260,6 +267,8 @@ async function pollUntilDone(
   while (Date.now() < deadline) {
     const preview = (await apiGet(
       `/custom-reports/previews/${uuid}`
+      ,
+      tokenOverride
     )) as ReportPreview;
 
     if (preview.status === "SUCCEEDED" || preview.status === "FAILED") {
@@ -291,7 +300,8 @@ server.tool(
   ReportRequestSchema,
   async (args) => {
     try {
-      const result = await apiPost("/custom-reports/previews", args);
+      const { adlook_token, ...reportArgs } = args;
+      const result = await apiPost("/custom-reports/previews", reportArgs, adlook_token);
       return {
         content: [
           {
@@ -320,10 +330,15 @@ server.tool(
       .string()
       .uuid()
       .describe("UUID podglądu zwrócony przez create_report_preview"),
+    adlook_token: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Opcjonalny token Bearer do Adlook API. Jeśli nie podasz, użyty będzie ADLOOK_TOKEN z env."),
   },
-  async ({ uuid }) => {
+  async ({ uuid, adlook_token }) => {
     try {
-      const result = await apiGet(`/custom-reports/previews/${uuid}`);
+      const result = await apiGet(`/custom-reports/previews/${uuid}`, adlook_token);
       return {
         content: [
           {
@@ -352,9 +367,11 @@ server.tool(
   ReportRequestSchema,
   async (reportArgs) => {
     try {
+      const { adlook_token, ...createArgs } = reportArgs;
       const created = (await apiPost(
         "/custom-reports/previews",
-        reportArgs
+        createArgs,
+        adlook_token
       )) as { uuid: string };
 
       return {

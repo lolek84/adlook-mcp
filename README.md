@@ -63,6 +63,7 @@ Zwraca `uuid` zadania.
 | `start_date` | `string` YYYY-MM-DD  | ✅        | Data początku (max 185 dni wstecz)          |
 | `end_date`   | `string` YYYY-MM-DD  | ✅        | Data końca (>= start_date)                  |
 | `filters`    | `Filter[]`           | ❌        | Filtry po ADVERTISER_UUID / CLIENT_UUID      |
+| `adlook_token` | `string`           | ❌        | Token Bearer podany w argumencie narzędzia (nadpisuje env `ADLOOK_TOKEN`) |
 
 **Przykład odpowiedzi:**
 ```json
@@ -80,6 +81,7 @@ Pobiera aktualny stan zadania (`GET /api/custom-reports/previews/{uuid}`).
 | Parametr | Typ    | Opis                       |
 |----------|--------|----------------------------|
 | `uuid`   | string | UUID zwrócony przez POST   |
+| `adlook_token` | string | Opcjonalny token Bearer (nadpisuje env `ADLOOK_TOKEN`) |
 
 **Możliwe statusy:** `PENDING` | `SUCCEEDED` | `FAILED`
 
@@ -90,7 +92,7 @@ Pobiera aktualny stan zadania (`GET /api/custom-reports/previews/{uuid}`).
 Łączy `create_report_preview` + polling `get_report_preview` w jednym wywołaniu.  
 Czeka aż zadanie osiągnie status `SUCCEEDED` lub `FAILED`.
 
-**Parametry:** wszystkie z `create_report_preview` plus:
+**Parametry:** wszystkie z `create_report_preview` (w tym opcjonalny `adlook_token`) plus:
 
 | Parametr           | Typ    | Domyślna | Opis                               |
 |--------------------|--------|----------|------------------------------------|
