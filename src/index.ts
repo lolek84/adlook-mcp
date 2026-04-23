@@ -26,7 +26,7 @@ import {
 
 // ── Stałe ────────────────────────────────────────────────────────────────────
 
-const BASE_URL = process.env.ADLOOK_BASE_URL ?? "https://api.smart.adlook.com/api";
+const BASE_URL = process.env.ADLOOK_BASE_URL ?? "https://smart.adlook.com/api";
 
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_POLL_TIMEOUT_MS = 120_000;

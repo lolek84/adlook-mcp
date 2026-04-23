@@ -4,7 +4,7 @@
  * Opcjonalnie: własny URL (ADLOOK_OAUTH_TOKEN_URL) lub tryb OAuth2 form (ADLOOK_TOKEN_REFRESH_MODE=oauth2).
  */
 
-const API_BASE = (process.env.ADLOOK_BASE_URL ?? "https://api.smart.adlook.com/api").replace(
+const API_BASE = (process.env.ADLOOK_BASE_URL ?? "https://smart.adlook.com/api").replace(
   /\/$/,
   ""
 );
