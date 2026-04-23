@@ -21,7 +21,7 @@ Ustaw zmienne środowiskowe przed uruchomieniem:
 | Zmienna           | Opis                                  | Domyślna                                   |
 |-------------------|---------------------------------------|--------------------------------------------|
 | `ADLOOK_TOKEN`    | JWT Bearer token (wymagany)           | —                                          |
-| `ADLOOK_BASE_URL` | Bazowy URL API                        | `https://api.uat.smart.adlook.com/api`     |
+| `ADLOOK_BASE_URL` | Bazowy URL API                        | `https://api.smart.adlook.com/api`         |
 
 ## Uruchomienie
 
