@@ -206,6 +206,113 @@ const ReportRequestSchema = {
     .describe("Opcjonalny token Bearer do Adlook API. Jeśli nie podasz, użyty będzie ADLOOK_TOKEN z env."),
 };
 
+// ── Schematy filtrów post-processingu ────────────────────────────────────────
+
+type ConditionInput =
+  | { column: string; regexp: string; flags?: string }
+  | { column: string; gt?: number; gte?: number; lt?: number; lte?: number }
+  | { and: ConditionInput[] }
+  | { or: ConditionInput[] };
+
+const filterLeafSchema = z.object({
+  column: z.string().describe("Nazwa kolumny"),
+  regexp: z.string().describe("Wyrażenie regularne JS"),
+  flags: z
+    .string()
+    .optional()
+    .describe("Flagi RegExp, domyślnie 'i'; flaga 'g' jest ignorowana"),
+});
+
+const filterRangeSchema = z
+  .object({
+    column: z.string().describe("Nazwa kolumny numerycznej"),
+    gt: z.number().optional().describe("Strictly greater than (>)"),
+    gte: z.number().optional().describe("Greater than or equal (>=)"),
+    lt: z.number().optional().describe("Strictly less than (<)"),
+    lte: z.number().optional().describe("Less than or equal (<=)"),
+  })
+  .refine(
+    (v) =>
+      v.gt !== undefined ||
+      v.gte !== undefined ||
+      v.lt !== undefined ||
+      v.lte !== undefined,
+    { message: "FilterRange wymaga przynajmniej jednej granicy: gt, gte, lt lub lte" }
+  );
+
+const conditionSchema: z.ZodType<ConditionInput> = z.lazy(() =>
+  z.union([
+    filterLeafSchema,
+    filterRangeSchema,
+    z.object({ and: z.array(conditionSchema).min(1) }),
+    z.object({ or: z.array(conditionSchema).min(1) }),
+  ])
+);
+
+const PostProcessingSchema = {
+  result_filters: z
+    .optional(conditionSchema)
+    .describe(
+      "Drzewo warunków filtrowania wyników po stronie MCP: REGEXP (dopasowanie tekstowe), " +
+        "zakres numeryczny (gt/gte/lt/lte), zagnieżdżone AND/OR. " +
+        'Odróżnia się od "filters" (filtr UUID po stronie API).'
+    ),
+  sort: z
+    .optional(
+      z.object({
+        column: z.string().describe("Nazwa kolumny do sortowania"),
+        direction: z.enum(["ASC", "DESC"]).describe("Kierunek sortowania"),
+      })
+    )
+    .describe("Sortowanie wyników po dowolnej kolumnie (po filtrowaniu, przed limitowaniem)"),
+  top: z
+    .optional(z.number().int().min(1))
+    .describe("Ogranicz wyniki do N pierwszych wierszy (po filtrowaniu i sortowaniu)"),
+  columns: z
+    .optional(z.array(z.string()).min(1))
+    .describe("Podzbiór kolumn do zwrócenia (projekcja; nieistniejące kolumny pomijane)"),
+  group_by: z
+    .optional(z.array(z.string()).min(1))
+    .describe("Kolumny grupujące — musi być użyte razem z aggregate"),
+  aggregate: z
+    .optional(
+      z
+        .array(
+          z.object({
+            column: z.string().describe("Kolumna do agregacji"),
+            fn: z
+              .enum(["SUM", "AVG", "MIN", "MAX", "COUNT"])
+              .describe("Funkcja agregująca"),
+            as: z
+              .string()
+              .optional()
+              .describe("Opcjonalna nazwa wynikowej kolumny (domyślnie: FN_COLUMN)"),
+          })
+        )
+        .min(1)
+    )
+    .describe("Funkcje agregujące — musi być użyte razem z group_by"),
+  summarize: z
+    .optional(z.literal(true))
+    .describe(
+      "Zamiast danych zwróć statystyki opisowe (min/max/sum/avg dla numerycznych, " +
+        "distinct_count/sample_values dla tekstowych). Wyklucza: aggregate, distinct."
+    ),
+  distinct: z
+    .optional(z.string())
+    .describe(
+      "Zwróć posortowaną listę unikalnych wartości dla wskazanej kolumny. " +
+        "Wyklucza: aggregate, summarize, sort, top, columns."
+    ),
+  output_format: z
+    .optional(z.enum(["json", "columnar", "csv"]))
+    .describe(
+      'Format serializacji wyników: "json" (domyślny, tablica obiektów), ' +
+        '"columnar" (nagłówki raz + tablica tablic — ~50% mniej tokenów), ' +
+        '"csv" (string CSV). Nie dotyczy trybów summarize/distinct.'
+    ),
+};
+
 // ── Pomocniki HTTP ────────────────────────────────────────────────────────────
 
 function bearerJsonHeaders(accessToken: string): Record<string, string> {
@@ -310,6 +417,450 @@ async function pollUntilDone(
   );
 }
 
+// ── Post-processing ────────────────────────────────────────────────────────────
+
+type Row = Record<string, unknown>;
+
+interface ColumnSummary {
+  column: string;
+  type: "numeric" | "text";
+  count: number;
+  null_count: number;
+  min?: number;
+  max?: number;
+  sum?: number;
+  avg?: number;
+  distinct_count?: number | "+";
+  sample_values?: string[];
+}
+
+interface ColumnarResult {
+  columns: string[];
+  rows: unknown[][];
+}
+
+type PostProcessingArgs = {
+  result_filters?: ConditionInput;
+  sort?: { column: string; direction: "ASC" | "DESC" };
+  top?: number;
+  columns?: string[];
+  group_by?: string[];
+  aggregate?: Array<{ column: string; fn: "SUM" | "AVG" | "MIN" | "MAX" | "COUNT"; as?: string }>;
+  summarize?: true;
+  distinct?: string;
+  output_format?: "json" | "columnar" | "csv";
+};
+
+function detectColumnType(rows: Row[], column: string): "numeric" | "text" {
+  const firstNonNull = rows.find((row) => row[column] != null);
+  if (!firstNonNull) return "text";
+  return !isNaN(Number(firstNonNull[column])) ? "numeric" : "text";
+}
+
+function evaluateCondition(row: Row, condition: ConditionInput): boolean {
+  if ("and" in condition) {
+    return (condition as { and: ConditionInput[] }).and.every((c) =>
+      evaluateCondition(row, c)
+    );
+  }
+  if ("or" in condition) {
+    return (condition as { or: ConditionInput[] }).or.some((c) =>
+      evaluateCondition(row, c)
+    );
+  }
+  const col = (condition as { column: string }).column;
+  if ("regexp" in condition) {
+    const leaf = condition as { column: string; regexp: string; flags?: string };
+    const val = row[col] ?? "";
+    const str = String(val);
+    const flags = (leaf.flags ?? "i").replace(/g/gi, "");
+    // throws on invalid regexp — caught by applyFiltering
+    const re = new RegExp(leaf.regexp, flags);
+    return re.test(str);
+  }
+  // FilterRange
+  const range = condition as {
+    column: string;
+    gt?: number;
+    gte?: number;
+    lt?: number;
+    lte?: number;
+  };
+  const rawVal = row[col];
+  if (rawVal == null) return false;
+  const num = Number(rawVal);
+  if (isNaN(num)) return false;
+  if (range.gt !== undefined && !(num > range.gt)) return false;
+  if (range.gte !== undefined && !(num >= range.gte)) return false;
+  if (range.lt !== undefined && !(num < range.lt)) return false;
+  if (range.lte !== undefined && !(num <= range.lte)) return false;
+  return true;
+}
+
+function applyFiltering(
+  rows: Row[],
+  condition: ConditionInput
+): { rows: Row[]; error?: string } {
+  try {
+    return { rows: rows.filter((row) => evaluateCondition(row, condition)) };
+  } catch (e) {
+    return { rows: [], error: (e as Error).message };
+  }
+}
+
+function applyAggregation(
+  rows: Row[],
+  group_by: string[],
+  aggregate: Array<{
+    column: string;
+    fn: "SUM" | "AVG" | "MIN" | "MAX" | "COUNT";
+    as?: string;
+  }>
+): Row[] {
+  const groupMap = new Map<string, Row[]>();
+  const groupKeys = new Map<string, Record<string, unknown>>();
+
+  for (const row of rows) {
+    const vals = group_by.map((col) => row[col] ?? null);
+    const key = JSON.stringify(vals);
+    if (!groupMap.has(key)) {
+      groupMap.set(key, []);
+      const keyRow: Record<string, unknown> = {};
+      for (let i = 0; i < group_by.length; i++) {
+        keyRow[group_by[i]] = vals[i];
+      }
+      groupKeys.set(key, keyRow);
+    }
+    groupMap.get(key)!.push(row);
+  }
+
+  const result: Row[] = [];
+
+  for (const [key, groupRows] of groupMap) {
+    const outRow: Row = { ...groupKeys.get(key)! };
+
+    for (const agg of aggregate) {
+      const outCol = agg.as ?? `${agg.fn}_${agg.column}`;
+
+      if (agg.fn === "COUNT") {
+        outRow[outCol] = groupRows.length;
+        continue;
+      }
+
+      const nonNullVals = groupRows.map((r) => r[agg.column]).filter((v) => v != null);
+
+      if (agg.fn === "SUM" || agg.fn === "AVG") {
+        const nums = nonNullVals.map((v) => Number(v)).filter((v) => !isNaN(v));
+        if (nums.length === 0) {
+          outRow[outCol] = null;
+        } else if (agg.fn === "SUM") {
+          outRow[outCol] = nums.reduce((a, b) => a + b, 0);
+        } else {
+          outRow[outCol] = nums.reduce((a, b) => a + b, 0) / nums.length;
+        }
+        continue;
+      }
+
+      // MIN / MAX
+      if (nonNullVals.length === 0) {
+        outRow[outCol] = null;
+        continue;
+      }
+
+      const firstNonNull = nonNullVals[0];
+      const isNumeric = !isNaN(Number(firstNonNull));
+      if (isNumeric) {
+        const nums = nonNullVals.map((v) => Number(v)).filter((v) => !isNaN(v));
+        outRow[outCol] = agg.fn === "MIN" ? Math.min(...nums) : Math.max(...nums);
+      } else {
+        const strs = nonNullVals.map((v) => String(v));
+        outRow[outCol] =
+          agg.fn === "MIN"
+            ? strs.reduce((a, b) => (a.localeCompare(b) <= 0 ? a : b))
+            : strs.reduce((a, b) => (a.localeCompare(b) >= 0 ? a : b));
+      }
+    }
+
+    result.push(outRow);
+  }
+
+  return result;
+}
+
+function applySorting(
+  rows: Row[],
+  sort: { column: string; direction: "ASC" | "DESC" }
+): { rows: Row[]; error?: string } {
+  if (rows.length === 0) return { rows };
+  const colExists = rows.some((row) => sort.column in row);
+  if (!colExists) {
+    return {
+      rows,
+      error: `Kolumna '${sort.column}' nie istnieje w wynikach raportu.`,
+    };
+  }
+
+  const type = detectColumnType(rows, sort.column);
+  const sorted = [...rows].sort((a, b) => {
+    const va = a[sort.column];
+    const vb = b[sort.column];
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+
+    const cmp =
+      type === "numeric"
+        ? Number(va) - Number(vb)
+        : String(va).localeCompare(String(vb), undefined, { sensitivity: "base" });
+    return sort.direction === "DESC" ? -cmp : cmp;
+  });
+
+  return { rows: sorted };
+}
+
+function applyProjection(
+  rows: Row[],
+  columns: string[]
+): { rows: Row[]; error?: string } {
+  if (rows.length === 0) return { rows };
+  const existing = columns.filter((col) => rows.some((row) => col in row));
+  if (existing.length === 0) {
+    return { rows, error: "Żadna z podanych kolumn nie istnieje w wynikach raportu." };
+  }
+  return {
+    rows: rows.map((row) => {
+      const out: Row = {};
+      for (const col of existing) out[col] = row[col];
+      return out;
+    }),
+  };
+}
+
+function applyOutputFormat(
+  rows: Row[],
+  format: "json" | "columnar" | "csv",
+  columnOrder?: string[]
+): Row[] | ColumnarResult | string {
+  if (format === "json") return rows;
+  const cols = columnOrder ?? (rows.length > 0 ? Object.keys(rows[0]) : []);
+
+  if (format === "columnar") {
+    return {
+      columns: cols,
+      rows: rows.map((row) => cols.map((col) => row[col] ?? null)),
+    };
+  }
+
+  // CSV
+  const lines: string[] = [cols.join(",")];
+  for (const row of rows) {
+    const vals = cols.map((col) => {
+      const v = row[col];
+      if (v == null) return "";
+      const s = String(v);
+      if (s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r")) {
+        return `"${s.replace(/"/g, '""')}"`;
+      }
+      return s;
+    });
+    lines.push(vals.join(","));
+  }
+  return lines.join("\n") + "\n";
+}
+
+function buildSummary(rows: Row[]): ColumnSummary[] {
+  if (rows.length === 0) return [];
+  const columns = Object.keys(rows[0]);
+  const summary: ColumnSummary[] = [];
+
+  for (const col of columns) {
+    const values = rows.map((r) => r[col]);
+    const nonNull = values.filter((v) => v != null);
+    const null_count = values.length - nonNull.length;
+    const type: "numeric" | "text" =
+      nonNull.length > 0 && !isNaN(Number(nonNull[0])) ? "numeric" : "text";
+
+    if (type === "numeric") {
+      const nums = nonNull.map((v) => Number(v)).filter((v) => !isNaN(v));
+      const sum = nums.reduce((a, b) => a + b, 0);
+      summary.push({
+        column: col,
+        type: "numeric",
+        count: nonNull.length,
+        null_count,
+        min: nums.length ? Math.min(...nums) : undefined,
+        max: nums.length ? Math.max(...nums) : undefined,
+        sum: nums.length ? sum : undefined,
+        avg: nums.length ? sum / nums.length : undefined,
+      });
+    } else {
+      const strs = nonNull.map((v) => String(v));
+      const distinct = new Set(strs);
+      const dc = distinct.size;
+      summary.push({
+        column: col,
+        type: "text",
+        count: nonNull.length,
+        null_count,
+        distinct_count: dc > 1000 ? "+" : dc,
+        sample_values: Array.from(distinct).slice(0, 5),
+      });
+    }
+  }
+
+  return summary;
+}
+
+function buildDistinct(
+  rows: Row[],
+  column: string
+): { values: unknown[]; distinct_count: number } {
+  const seen = new Map<string, unknown>();
+  let hasNull = false;
+
+  for (const row of rows) {
+    const val = row[column];
+    if (val == null) {
+      hasNull = true;
+    } else {
+      const k = `${typeof val}:${String(val)}`;
+      if (!seen.has(k)) seen.set(k, val);
+    }
+  }
+
+  const values = Array.from(seen.values());
+  const isNumeric = values.length > 0 && !isNaN(Number(values[0]));
+  values.sort((a, b) =>
+    isNumeric
+      ? Number(a) - Number(b)
+      : String(a).localeCompare(String(b))
+  );
+  if (hasNull) values.push(null);
+
+  return { values, distinct_count: values.length };
+}
+
+function validatePostProcessing(args: PostProcessingArgs): string | null {
+  const hasGroupBy = args.group_by != null;
+  const hasAggregate = args.aggregate != null;
+  const hasSummarize = args.summarize === true;
+  const hasDistinct = args.distinct != null;
+
+  if (hasGroupBy !== hasAggregate) {
+    return "Parametry 'group_by' i 'aggregate' muszą być podane razem (oba lub żadne).";
+  }
+  if (hasSummarize && (hasGroupBy || hasDistinct)) {
+    return "Parametr 'summarize' nie może być użyty z 'group_by'/'aggregate' ani 'distinct'.";
+  }
+  if (hasDistinct) {
+    if (hasGroupBy) return "Parametr 'distinct' nie może być użyty z 'group_by'/'aggregate'.";
+    if (args.sort) return "Parametr 'distinct' nie może być użyty z 'sort'.";
+    if (args.top) return "Parametr 'distinct' nie może być użyty z 'top'.";
+    if (args.columns) return "Parametr 'distinct' nie może być użyty z 'columns'.";
+  }
+  return null;
+}
+
+function runPostProcessing(
+  preview: ReportPreview,
+  args: PostProcessingArgs
+): { isError?: boolean; payload: Record<string, unknown> } {
+  if (preview.status !== "SUCCEEDED" || !preview.result) {
+    return { payload: preview as unknown as Record<string, unknown> };
+  }
+
+  const total_rows = preview.total_rows;
+  let rows: Row[] = preview.result;
+  let filtered_rows: number | undefined;
+
+  const processing = {
+    filtered: false,
+    aggregated: false,
+    sorted: false,
+    limited: false,
+    projected: false,
+    output_format: args.output_format ?? ("json" as "json" | "columnar" | "csv"),
+  };
+
+  // 1. Filter
+  if (args.result_filters) {
+    const r = applyFiltering(rows, args.result_filters);
+    if (r.error) return { isError: true, payload: { error: r.error } };
+    rows = r.rows;
+    filtered_rows = rows.length;
+    processing.filtered = true;
+  }
+
+  // Summarize mode
+  if (args.summarize) {
+    const summary = buildSummary(rows);
+    const resp: Record<string, unknown> = { status: "SUCCEEDED", total_rows, summary };
+    if (filtered_rows !== undefined) resp.filtered_rows = filtered_rows;
+    return { payload: resp };
+  }
+
+  // Distinct mode
+  if (args.distinct) {
+    const { values, distinct_count } = buildDistinct(rows, args.distinct);
+    const resp: Record<string, unknown> = {
+      status: "SUCCEEDED",
+      total_rows,
+      column: args.distinct,
+      values,
+      distinct_count,
+    };
+    if (filtered_rows !== undefined) resp.filtered_rows = filtered_rows;
+    return { payload: resp };
+  }
+
+  // 2. Aggregate
+  let aggregated_rows: number | undefined;
+  if (args.group_by && args.aggregate) {
+    rows = applyAggregation(rows, args.group_by, args.aggregate);
+    aggregated_rows = rows.length;
+    processing.aggregated = true;
+  }
+
+  // 3. Sort
+  if (args.sort) {
+    const r = applySorting(rows, args.sort);
+    if (r.error) return { isError: true, payload: { error: r.error } };
+    rows = r.rows;
+    processing.sorted = true;
+  }
+
+  // 4. Limit
+  if (args.top !== undefined) {
+    rows = rows.slice(0, args.top);
+    processing.limited = true;
+  }
+
+  // 5. Project columns
+  let projectedColumns: string[] | undefined;
+  if (args.columns) {
+    const r = applyProjection(rows, args.columns);
+    if (r.error) return { isError: true, payload: { error: r.error } };
+    rows = r.rows;
+    processing.projected = true;
+    projectedColumns = args.columns.filter((col) => rows.some((row) => col in row));
+  }
+
+  // 6. Serialize
+  const formatted = applyOutputFormat(rows, processing.output_format, projectedColumns);
+
+  const resp: Record<string, unknown> = {
+    status: "SUCCEEDED",
+    total_rows,
+    result: formatted,
+    returned_rows: rows.length,
+    processing_applied: processing,
+  };
+  if (filtered_rows !== undefined) resp.filtered_rows = filtered_rows;
+  if (aggregated_rows !== undefined) resp.aggregated_rows = aggregated_rows;
+
+  return { payload: resp };
+}
+
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -402,7 +953,8 @@ server.tool(
 server.tool(
   "get_report_preview",
   "Pobiera aktualny stan podglądu raportu (GET /api/custom-reports/previews/{uuid}). " +
-    "Status PENDING oznacza, że zadanie jest jeszcze przetwarzane.",
+    "Status PENDING oznacza, że zadanie jest jeszcze przetwarzane. " +
+    "Jeśli status to SUCCEEDED, można zastosować post-processing: filtrowanie, agregację, sortowanie, limitowanie, projekcję kolumn i zmianę formatu.",
   {
     uuid: z
       .string()
@@ -413,17 +965,25 @@ server.tool(
       .min(1)
       .optional()
       .describe("Opcjonalny token Bearer do Adlook API. Jeśli nie podasz, użyty będzie ADLOOK_TOKEN z env."),
+    ...PostProcessingSchema,
   },
-  async ({ uuid, adlook_token }) => {
+  async ({ uuid, adlook_token, ...ppArgs }) => {
     try {
-      const result = await apiGet(`/custom-reports/previews/${uuid}`, adlook_token);
+      const validationError = validatePostProcessing(ppArgs as PostProcessingArgs);
+      if (validationError) {
+        return {
+          content: [{ type: "text", text: validationError }],
+          isError: true,
+        };
+      }
+
+      const raw = await apiGet(`/custom-reports/previews/${uuid}`, adlook_token);
+      const preview = raw as ReportPreview;
+
+      const { isError, payload } = runPostProcessing(preview, ppArgs as PostProcessingArgs);
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        ...(isError ? { isError: true } : {}),
       };
     } catch (err) {
       return {
@@ -438,31 +998,37 @@ server.tool(
 
 server.tool(
   "run_report_preview",
-  "Tworzy zadanie raportu (POST) i natychmiast zwraca UUID — BEZ CZEKANIA na wynik. " +
-    "Następnie wywołuj get_report_preview z tym UUID co kilka sekund, " +
-    "aż status zmieni się na SUCCEEDED lub FAILED. " +
-    "Takie podejście jest wymagane ze względu na limity timeoutu serwera.",
-  ReportRequestSchema,
+  "Tworzy zadanie raportu (POST), czeka na jego zakończenie (polling GET) i zwraca wynik. " +
+    "Obsługuje pełny post-processing po stronie MCP: filtrowanie (result_filters), " +
+    "agregację (group_by + aggregate), sortowanie (sort), limitowanie (top), " +
+    "projekcję kolumn (columns), statystyki opisowe (summarize), " +
+    "unikalne wartości (distinct) i format wyjściowy (output_format).",
+  { ...ReportRequestSchema, ...PostProcessingSchema },
   async (reportArgs) => {
     try {
-      const { adlook_token, ...createArgs } = reportArgs;
+      const { adlook_token, result_filters, sort, top, columns, group_by, aggregate, summarize, distinct, output_format, ...createArgs } = reportArgs;
+      const ppArgs: PostProcessingArgs = { result_filters, sort, top, columns, group_by, aggregate, summarize, distinct, output_format };
+
+      const validationError = validatePostProcessing(ppArgs);
+      if (validationError) {
+        return {
+          content: [{ type: "text", text: validationError }],
+          isError: true,
+        };
+      }
+
       const created = (await apiPost(
         "/custom-reports/previews",
         createArgs,
         adlook_token
       )) as { uuid: string };
 
+      const preview = await pollUntilDone(created.uuid, adlook_token);
+
+      const { isError, payload } = runPostProcessing(preview, ppArgs);
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              uuid: created.uuid,
-              status: "PENDING",
-              message: "Zadanie zostało utworzone. Wywołaj get_report_preview z tym UUID za 5-10 sekund aby sprawdzić wynik. Powtarzaj aż status będzie SUCCEEDED lub FAILED.",
-            }, null, 2),
-          },
-        ],
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        ...(isError ? { isError: true } : {}),
       };
     } catch (err) {
       return {
