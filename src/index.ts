@@ -31,6 +31,81 @@ const BASE_URL = process.env.ADLOOK_BASE_URL ?? "https://smart.adlook.com/api";
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_POLL_TIMEOUT_MS = 120_000;
 
+// ── Cache advertiserów (name → UUID) — żyje przez całą sesję procesu ─────────
+
+/** lowercase(name) → uuid */
+let advertiserNameCache: Map<string, string> | null = null;
+
+function invalidateAdvertiserCache(): void {
+  advertiserNameCache = null;
+}
+
+async function getAdvertiserCache(tokenOverride?: string): Promise<Map<string, string>> {
+  if (advertiserNameCache) return advertiserNameCache;
+
+  const now = new Date();
+  const end = new Date(now);
+  end.setDate(end.getDate() - 1);
+  const start = new Date(end);
+  start.setDate(start.getDate() - 89);
+  const fmt = (d: Date) => d.toISOString().slice(0, 10);
+
+  const created = (await apiPost(
+    "/custom-reports/previews",
+    {
+      dimensions: ["ADVERTISER_NAME", "ADVERTISER_UUID"],
+      metrics: ["IMPRESSIONS"],
+      start_date: fmt(start),
+      end_date: fmt(end),
+    },
+    tokenOverride
+  )) as { uuid: string };
+
+  const preview = await pollUntilDone(created.uuid, tokenOverride);
+
+  if (preview.status !== "SUCCEEDED" || !preview.result) {
+    throw new Error("Nie udało się pobrać listy advertiserów (status: " + preview.status + ")");
+  }
+
+  const map = new Map<string, string>();
+  for (const row of preview.result) {
+    const name = row["ADVERTISER_NAME"];
+    const uuid = row["ADVERTISER_UUID"];
+    if (name && uuid && typeof name === "string" && typeof uuid === "string") {
+      map.set(name.toLowerCase(), uuid);
+    }
+  }
+
+  advertiserNameCache = map;
+  return map;
+}
+
+async function resolveAdvertiserName(name: string, tokenOverride?: string): Promise<string> {
+  const cache = await getAdvertiserCache(tokenOverride);
+  const query = name.toLowerCase().trim();
+
+  if (cache.has(query)) return cache.get(query)!;
+
+  const matches: Array<{ displayName: string; uuid: string }> = [];
+  for (const [n, uuid] of cache) {
+    if (n.includes(query)) matches.push({ displayName: n, uuid });
+  }
+
+  if (matches.length === 1) return matches[0].uuid;
+
+  if (matches.length > 1) {
+    const names = matches.map((m) => m.displayName).join(", ");
+    throw new Error(
+      `Niejednoznaczna nazwa advertisera "${name}" — pasuje kilka: ${names}. Podaj dokładniejszą nazwę.`
+    );
+  }
+
+  const available = Array.from(cache.keys()).sort().join(", ");
+  throw new Error(
+    `Nie znaleziono advertisera "${name}". Dostępni advertiserzy: ${available}`
+  );
+}
+
 // ── Katalog metryk (z opisami) ───────────────────────────────────────────────
 
 interface MetricDef {
@@ -199,6 +274,13 @@ const ReportRequestSchema = {
     .array(FilterSchema)
     .optional()
     .describe("Opcjonalne filtry (ADVERTISER_UUID / CLIENT_UUID)"),
+  advertiser_name: z
+    .string()
+    .optional()
+    .describe(
+      "Nazwa advertisera (lub jej fragment) — MCP automatycznie zamieni ją na ADVERTISER_UUID i doda do filters. " +
+        "Alternatywa dla ręcznego podawania UUID. Przy niejednoznacznym dopasowaniu zwróci błąd z listą kandydatów."
+    ),
   adlook_token: z
     .string()
     .min(1)
@@ -892,6 +974,7 @@ server.tool(
   async ({ access_token, refresh_token }) => {
     try {
       setSessionAuth(access_token, refresh_token);
+      invalidateAdvertiserCache();
       const canRefresh = isOAuthRefreshConfigured();
       return {
         content: [
@@ -929,7 +1012,13 @@ server.tool(
   ReportRequestSchema,
   async (args) => {
     try {
-      const { adlook_token, ...reportArgs } = args;
+      const { adlook_token, advertiser_name, ...reportArgs } = args;
+
+      if (advertiser_name) {
+        const uuid = await resolveAdvertiserName(advertiser_name, adlook_token);
+        reportArgs.filters = [...(reportArgs.filters ?? []), { field: "ADVERTISER_UUID", value: [uuid] }];
+      }
+
       const result = await apiPost("/custom-reports/previews", reportArgs, adlook_token);
       return {
         content: [
@@ -1006,8 +1095,13 @@ server.tool(
   { ...ReportRequestSchema, ...PostProcessingSchema },
   async (reportArgs) => {
     try {
-      const { adlook_token, result_filters, sort, top, columns, group_by, aggregate, summarize, distinct, output_format, ...createArgs } = reportArgs;
+      const { adlook_token, advertiser_name, result_filters, sort, top, columns, group_by, aggregate, summarize, distinct, output_format, ...createArgs } = reportArgs;
       const ppArgs: PostProcessingArgs = { result_filters, sort, top, columns, group_by, aggregate, summarize, distinct, output_format };
+
+      if (advertiser_name) {
+        const uuid = await resolveAdvertiserName(advertiser_name, adlook_token);
+        createArgs.filters = [...(createArgs.filters ?? []), { field: "ADVERTISER_UUID", value: [uuid] }];
+      }
 
       const validationError = validatePostProcessing(ppArgs);
       if (validationError) {
