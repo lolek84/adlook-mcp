@@ -25,7 +25,6 @@ const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_POLL_TIMEOUT_MS = 120_000;
 // ── Cache advertiserów (name → UUID) — TTL 1h ────────────────────────────────
 const ADVERTISER_CACHE_TTL_MS = 60 * 60 * 1000; // 1 godzina
-/** lowercase(name) → uuid */
 let advertiserNameCache = null;
 let advertiserCacheTimestamp = 0;
 function invalidateAdvertiserCache() {
@@ -57,7 +56,7 @@ async function getAdvertiserCache(tokenOverride) {
         const name = row["ADVERTISER_NAME"];
         const uuid = row["ADVERTISER_UUID"];
         if (name && uuid && typeof name === "string" && typeof uuid === "string") {
-            map.set(name.toLowerCase(), uuid);
+            map.set(name.toLowerCase(), { uuid, name });
         }
     }
     advertiserCacheTimestamp = Date.now();
@@ -68,11 +67,11 @@ async function resolveAdvertiserName(name, tokenOverride) {
     const cache = await getAdvertiserCache(tokenOverride);
     const query = name.toLowerCase().trim();
     if (cache.has(query))
-        return cache.get(query);
+        return cache.get(query).uuid;
     const matches = [];
-    for (const [n, uuid] of cache) {
+    for (const [n, entry] of cache) {
         if (n.includes(query))
-            matches.push({ displayName: n, uuid });
+            matches.push({ displayName: entry.name, uuid: entry.uuid });
     }
     if (matches.length === 1)
         return matches[0].uuid;
@@ -80,7 +79,7 @@ async function resolveAdvertiserName(name, tokenOverride) {
         const names = matches.map((m) => m.displayName).join(", ");
         throw new Error(`Niejednoznaczna nazwa advertisera "${name}" — pasuje kilka: ${names}. Podaj dokładniejszą nazwę.`);
     }
-    const available = Array.from(cache.keys()).sort().join(", ");
+    const available = Array.from(cache.values()).map((e) => e.name).sort().join(", ");
     throw new Error(`Nie znaleziono advertisera "${name}". Dostępni advertiserzy: ${available}`);
 }
 // ── Skróty dat (period) ───────────────────────────────────────────────────────
@@ -555,11 +554,21 @@ async function pollUntilDone(uuid, tokenOverride, intervalMs = DEFAULT_POLL_INTE
     }
     throw new Error(`Timeout: zadanie ${uuid} nie zakończyło się w ciągu ${timeoutMs / 1000}s`);
 }
+// ── Post-processing ────────────────────────────────────────────────────────────
+/** Parsuje wartości numeryczne i procentowe ("63.80%" → 63.80). */
+function parseNumeric(v) {
+    if (v == null)
+        return NaN;
+    if (typeof v === "number")
+        return v;
+    const s = String(v).trim();
+    return Number(s.endsWith("%") ? s.slice(0, -1) : s);
+}
 function detectColumnType(rows, column) {
     const firstNonNull = rows.find((row) => row[column] != null);
     if (!firstNonNull)
         return "text";
-    return !isNaN(Number(firstNonNull[column])) ? "numeric" : "text";
+    return !isNaN(parseNumeric(firstNonNull[column])) ? "numeric" : "text";
 }
 function evaluateCondition(row, condition) {
     if ("and" in condition) {
@@ -583,7 +592,7 @@ function evaluateCondition(row, condition) {
     const rawVal = row[col];
     if (rawVal == null)
         return false;
-    const num = Number(rawVal);
+    const num = parseNumeric(rawVal);
     if (isNaN(num))
         return false;
     if (range.gt !== undefined && !(num > range.gt))
@@ -631,7 +640,7 @@ function applyAggregation(rows, group_by, aggregate) {
             }
             const nonNullVals = groupRows.map((r) => r[agg.column]).filter((v) => v != null);
             if (agg.fn === "SUM" || agg.fn === "AVG") {
-                const nums = nonNullVals.map((v) => Number(v)).filter((v) => !isNaN(v));
+                const nums = nonNullVals.map(parseNumeric).filter((v) => !isNaN(v));
                 if (nums.length === 0) {
                     outRow[outCol] = null;
                 }
@@ -649,9 +658,9 @@ function applyAggregation(rows, group_by, aggregate) {
                 continue;
             }
             const firstNonNull = nonNullVals[0];
-            const isNumeric = !isNaN(Number(firstNonNull));
+            const isNumeric = !isNaN(parseNumeric(firstNonNull));
             if (isNumeric) {
-                const nums = nonNullVals.map((v) => Number(v)).filter((v) => !isNaN(v));
+                const nums = nonNullVals.map(parseNumeric).filter((v) => !isNaN(v));
                 outRow[outCol] = agg.fn === "MIN" ? Math.min(...nums) : Math.max(...nums);
             }
             else {
@@ -687,7 +696,7 @@ function applySorting(rows, sort) {
         if (vb == null)
             return -1;
         const cmp = type === "numeric"
-            ? Number(va) - Number(vb)
+            ? parseNumeric(va) - parseNumeric(vb)
             : String(va).localeCompare(String(vb), undefined, { sensitivity: "base" });
         return sort.direction === "DESC" ? -cmp : cmp;
     });
@@ -745,9 +754,9 @@ function buildSummary(rows) {
         const values = rows.map((r) => r[col]);
         const nonNull = values.filter((v) => v != null);
         const null_count = values.length - nonNull.length;
-        const type = nonNull.length > 0 && !isNaN(Number(nonNull[0])) ? "numeric" : "text";
+        const type = nonNull.length > 0 && !isNaN(parseNumeric(nonNull[0])) ? "numeric" : "text";
         if (type === "numeric") {
-            const nums = nonNull.map((v) => Number(v)).filter((v) => !isNaN(v));
+            const nums = nonNull.map(parseNumeric).filter((v) => !isNaN(v));
             const sum = nums.reduce((a, b) => a + b, 0);
             summary.push({
                 column: col,
@@ -960,8 +969,9 @@ function createServer() {
         }
     });
     // ── Narzędzie 1: create_report_preview ───────────────────────────────────────
-    server.tool("create_report_preview", "Tworzy asynchroniczne zadanie generowania podglądu raportu (POST /api/custom-reports/previews). " +
-        "Zwraca UUID zadania. Wynik należy pobrać narzędziem get_report_preview lub run_report_preview.", ReportRequestSchema, async (args) => {
+    server.tool("create_report_preview", "Niskopoziomowe narzędzie: tworzy zadanie raportu i zwraca UUID (bez czekania na wynik). " +
+        "Używaj TYLKO gdy potrzebujesz UUID do własnego pollingu. " +
+        "W pozostałych przypadkach użyj run_report_preview — robi to samo w jednym wywołaniu.", ReportRequestSchema, async (args) => {
         try {
             const { adlook_token, advertiser_name, period, start_date, end_date, ...reportArgs } = args;
             const dates = resolveDateRange(start_date, end_date, period);
@@ -1178,8 +1188,7 @@ function createServer() {
     }, async ({ search, adlook_token }) => {
         try {
             const cache = await getAdvertiserCache(adlook_token);
-            let entries = Array.from(cache.entries())
-                .map(([name, uuid]) => ({ name, uuid }))
+            let entries = Array.from(cache.values())
                 .sort((a, b) => a.name.localeCompare(b.name));
             if (search) {
                 const q = search.toLowerCase();
