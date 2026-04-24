@@ -5,9 +5,13 @@
  *
  * Narzędzia:
  *   set_adlook_auth        – tokeny z przeglądarki na sesję (pamięć procesu)
+ *   check_auth             – sprawdza status tokenu (bez API call)
+ *   list_advertisers       – lista advertiserów (name → UUID, z cache 1h)
+ *   list_dimensions        – katalog wymiarów z opisami
+ *   list_metrics           – katalog metryk z opisami
  *   create_report_preview  – POST /api/custom-reports/previews
  *   get_report_preview     – GET  /api/custom-reports/previews/{uuid}
- *   run_report_preview     – POST + polling GET aż do SUCCEEDED / FAILED
+ *   run_report_preview     – POST + polling GET + pełny post-processing
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -19,15 +23,19 @@ import { invalidateCachedAccessToken, isOAuthRefreshConfigured, resolveAccessTok
 const BASE_URL = process.env.ADLOOK_BASE_URL ?? "https://smart.adlook.com/api";
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_POLL_TIMEOUT_MS = 120_000;
-// ── Cache advertiserów (name → UUID) — żyje przez całą sesję procesu ─────────
+// ── Cache advertiserów (name → UUID) — TTL 1h ────────────────────────────────
+const ADVERTISER_CACHE_TTL_MS = 60 * 60 * 1000; // 1 godzina
 /** lowercase(name) → uuid */
 let advertiserNameCache = null;
+let advertiserCacheTimestamp = 0;
 function invalidateAdvertiserCache() {
     advertiserNameCache = null;
+    advertiserCacheTimestamp = 0;
 }
 async function getAdvertiserCache(tokenOverride) {
-    if (advertiserNameCache)
+    if (advertiserNameCache && Date.now() - advertiserCacheTimestamp < ADVERTISER_CACHE_TTL_MS) {
         return advertiserNameCache;
+    }
     const now = new Date();
     const end = new Date(now);
     end.setDate(end.getDate() - 1);
@@ -52,6 +60,7 @@ async function getAdvertiserCache(tokenOverride) {
             map.set(name.toLowerCase(), uuid);
         }
     }
+    advertiserCacheTimestamp = Date.now();
     advertiserNameCache = map;
     return map;
 }
@@ -73,6 +82,88 @@ async function resolveAdvertiserName(name, tokenOverride) {
     }
     const available = Array.from(cache.keys()).sort().join(", ");
     throw new Error(`Nie znaleziono advertisera "${name}". Dostępni advertiserzy: ${available}`);
+}
+// ── Skróty dat (period) ───────────────────────────────────────────────────────
+const PERIOD_CODES = [
+    "today", "yesterday",
+    "last_7_days", "last_30_days",
+    "this_month", "last_month",
+    "this_quarter", "last_quarter",
+    "this_year", "last_year",
+];
+function resolvePeriod(period) {
+    const fmt = (d) => d.toISOString().slice(0, 10);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    switch (period) {
+        case "today": {
+            const s = fmt(today);
+            return { start_date: s, end_date: s };
+        }
+        case "yesterday": {
+            const d = new Date(today);
+            d.setDate(d.getDate() - 1);
+            const s = fmt(d);
+            return { start_date: s, end_date: s };
+        }
+        case "last_7_days": {
+            const end = new Date(today);
+            end.setDate(end.getDate() - 1);
+            const start = new Date(end);
+            start.setDate(start.getDate() - 6);
+            return { start_date: fmt(start), end_date: fmt(end) };
+        }
+        case "last_30_days": {
+            const end = new Date(today);
+            end.setDate(end.getDate() - 1);
+            const start = new Date(end);
+            start.setDate(start.getDate() - 29);
+            return { start_date: fmt(start), end_date: fmt(end) };
+        }
+        case "this_month": {
+            const start = new Date(today.getFullYear(), today.getMonth(), 1);
+            const end = new Date(today);
+            end.setDate(end.getDate() - 1);
+            return { start_date: fmt(start), end_date: fmt(end) };
+        }
+        case "last_month": {
+            const start = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+            const end = new Date(today.getFullYear(), today.getMonth(), 0);
+            return { start_date: fmt(start), end_date: fmt(end) };
+        }
+        case "this_quarter": {
+            const q = Math.floor(today.getMonth() / 3);
+            const start = new Date(today.getFullYear(), q * 3, 1);
+            const end = new Date(today);
+            end.setDate(end.getDate() - 1);
+            return { start_date: fmt(start), end_date: fmt(end) };
+        }
+        case "last_quarter": {
+            const q = Math.floor(today.getMonth() / 3);
+            const prevQStart = q === 0 ? new Date(today.getFullYear() - 1, 9, 1) : new Date(today.getFullYear(), (q - 1) * 3, 1);
+            const prevQEnd = new Date(today.getFullYear(), q * 3, 0);
+            return { start_date: fmt(prevQStart), end_date: fmt(prevQEnd) };
+        }
+        case "this_year": {
+            const start = new Date(today.getFullYear(), 0, 1);
+            const end = new Date(today);
+            end.setDate(end.getDate() - 1);
+            return { start_date: fmt(start), end_date: fmt(end) };
+        }
+        case "last_year": {
+            const start = new Date(today.getFullYear() - 1, 0, 1);
+            const end = new Date(today.getFullYear() - 1, 11, 31);
+            return { start_date: fmt(start), end_date: fmt(end) };
+        }
+    }
+}
+function resolveDateRange(start_date, end_date, period) {
+    if (period)
+        return resolvePeriod(period);
+    if (!start_date || !end_date) {
+        throw new Error("Wymagane: podaj 'period' (np. 'last_month') lub oba parametry 'start_date' i 'end_date'.");
+    }
+    return { start_date, end_date };
 }
 const METRICS_CATALOG = [
     // AUDIO
@@ -154,6 +245,75 @@ const METRICS_CATALOG = [
 ];
 // Indeks dla szybkiego wyszukiwania po kodzie
 const METRICS_BY_CODE = new Map(METRICS_CATALOG.map((m) => [m.code, m]));
+const DIMENSIONS_CATALOG = [
+    // TIME
+    { code: "DATE", name: "Date", description: "Dzień (YYYY-MM-DD). Użyj do analizy dziennych trendów.", group: "TIME" },
+    { code: "WEEK", name: "Week", description: "Tydzień (rok-numer). Użyj do analizy tygodniowej.", group: "TIME" },
+    { code: "MONTH", name: "Month", description: "Miesiąc (YYYY-MM). Użyj do analizy miesięcznej.", group: "TIME" },
+    { code: "YEAR", name: "Year", description: "Rok. Użyj do analizy rocznej.", group: "TIME" },
+    // GEO
+    { code: "CITY", name: "City", description: "Miasto użytkownika.", group: "GEO" },
+    { code: "REGION", name: "Region", description: "Region/województwo użytkownika.", group: "GEO" },
+    { code: "COUNTRY", name: "Country", description: "Kraj użytkownika (kod ISO).", group: "GEO" },
+    { code: "POSTAL_CODE", name: "Postal Code", description: "Kod pocztowy użytkownika.", group: "GEO" },
+    // DEVICE
+    { code: "DEVICE_TYPE", name: "Device Type", description: "Typ urządzenia: desktop, mobile, tablet, ctv.", group: "DEVICE" },
+    { code: "BROWSER", name: "Browser", description: "Przeglądarka użytkownika.", group: "DEVICE" },
+    { code: "OPERATING_SYSTEM", name: "Operating System", description: "System operacyjny użytkownika.", group: "DEVICE" },
+    { code: "ENVIRONMENT", name: "Environment", description: "Środowisko: web lub app.", group: "DEVICE" },
+    // ADVERTISER
+    { code: "ADVERTISER_NAME", name: "Advertiser Name", description: "Nazwa advertisera.", group: "ADVERTISER" },
+    { code: "ADVERTISER_UUID", name: "Advertiser UUID", description: "UUID advertisera.", group: "ADVERTISER" },
+    { code: "ADVERTISER_ID", name: "Advertiser ID", description: "Numeryczne ID advertisera.", group: "ADVERTISER" },
+    { code: "ADVERTISER_HASH", name: "Advertiser Hash", description: "Hash advertisera.", group: "ADVERTISER" },
+    { code: "ADVERTISER_COUNTRY", name: "Advertiser Country", description: "Kraj advertisera.", group: "ADVERTISER" },
+    { code: "ADVERTISER_CURRENCY", name: "Advertiser Currency", description: "Waluta advertisera.", group: "ADVERTISER" },
+    { code: "ADVERTISER_TIME_ZONE", name: "Advertiser Time Zone", description: "Strefa czasowa advertisera.", group: "ADVERTISER" },
+    { code: "BUSINESS_GROUP", name: "Business Group", description: "Grupa biznesowa advertisera.", group: "ADVERTISER" },
+    { code: "BRAND", name: "Brand", description: "Marka advertisera.", group: "ADVERTISER" },
+    { code: "VERTICAL", name: "Vertical", description: "Branża advertisera (np. Automotive, Finance).", group: "ADVERTISER" },
+    { code: "CLIENT_NAME", name: "Client Name", description: "Nazwa klienta/agencji.", group: "ADVERTISER" },
+    { code: "PROFIT_CENTER", name: "Profit Center", description: "Centrum kosztów.", group: "ADVERTISER" },
+    // CAMPAIGN
+    { code: "CAMPAIGN_NAME", name: "Campaign Name", description: "Nazwa kampanii. Użyj z campaign_name do filtrowania po nazwie.", group: "CAMPAIGN" },
+    { code: "CAMPAIGN_OBJECTIVE", name: "Campaign Objective", description: "Cel kampanii.", group: "CAMPAIGN" },
+    { code: "CAMPAIGN_BUDGET", name: "Campaign Budget", description: "Budżet kampanii.", group: "CAMPAIGN" },
+    { code: "CAMPAIGN_START_DATE", name: "Campaign Start Date", description: "Data startu kampanii.", group: "CAMPAIGN" },
+    { code: "CAMPAIGN_END_DATE", name: "Campaign End Date", description: "Data końca kampanii.", group: "CAMPAIGN" },
+    { code: "CAMPAIGN_STATUS", name: "Campaign Status", description: "Status kampanii: ACTIVE, PAUSED, ENDED.", group: "CAMPAIGN" },
+    { code: "SUBCAMPAIGN_ID", name: "Subcampaign ID", description: "ID subkampanii.", group: "CAMPAIGN" },
+    { code: "SUBCAMPAIGN_HASH", name: "Subcampaign Hash", description: "Hash subkampanii.", group: "CAMPAIGN" },
+    { code: "SUBCAMPAIGN_CLIENTS_GROUP", name: "Subcampaign Clients Group", description: "Grupa klientów subkampanii.", group: "CAMPAIGN" },
+    // LINE_ITEM
+    { code: "LINE_ITEM_NAME", name: "Line Item Name", description: "Nazwa line item. Użyj z line_item_name do filtrowania po nazwie.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_TYPE", name: "Line Item Type", description: "Typ line item.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_BUDGET", name: "Line Item Budget", description: "Budżet line item.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_GROUP_NAME", name: "Line Item Group Name", description: "Nazwa grupy line item.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_START_DATE", name: "Line Item Start Date", description: "Data startu line item.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_END_DATE", name: "Line Item End Date", description: "Data końca line item.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_BIDDING_MODEL", name: "Line Item Bidding Model", description: "Model licytacji: CPM, CPC itp.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_STATUS", name: "Line Item Status", description: "Status line item.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_PRIMARY_GOAL_NAME", name: "Primary Goal", description: "Główny cel line item.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_SECONDARY_GOAL_NAME", name: "Secondary Goal", description: "Dodatkowy cel line item.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_TERTIARY_GOAL_NAME", name: "Tertiary Goal", description: "Trzeci cel line item.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_PRIMARY_GOAL_VALUE", name: "Primary Goal Value", description: "Wartość głównego celu.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_SECONDARY_GOAL_VALUE", name: "Secondary Goal Value", description: "Wartość dodatkowego celu.", group: "LINE_ITEM" },
+    { code: "LINE_ITEM_TERTIARY_GOAL_VALUE", name: "Tertiary Goal Value", description: "Wartość trzeciego celu.", group: "LINE_ITEM" },
+    // CREATIVE
+    { code: "CREATIVE_NAME", name: "Creative Name", description: "Nazwa kreacji.", group: "CREATIVE" },
+    { code: "CREATIVE_HASH", name: "Creative Hash", description: "Hash kreacji.", group: "CREATIVE" },
+    { code: "CREATIVE_ID", name: "Creative ID", description: "ID kreacji.", group: "CREATIVE" },
+    { code: "CREATIVE_TYPE", name: "Creative Type", description: "Typ kreacji: BANNER, VIDEO, AUDIO.", group: "CREATIVE" },
+    { code: "CREATIVE_LINE", name: "Creative Line", description: "Linia kreacji.", group: "CREATIVE" },
+    { code: "CREATIVE_SIZE", name: "Creative Size", description: "Rozmiar kreacji (np. 300x250).", group: "CREATIVE" },
+    { code: "CREATIVE_DURATION", name: "Creative Duration", description: "Długość kreacji wideo/audio w sekundach.", group: "CREATIVE" },
+    // INVENTORY
+    { code: "DOMAIN", name: "Domain", description: "Pełna domena (np. www.onet.pl). Użyj do brand safety i analizy placementów.", group: "INVENTORY" },
+    { code: "TOP_LEVEL_DOMAIN", name: "Top Level Domain", description: "Domena bez subdomeny (np. onet.pl). Agreguje wszystkie subdomeny razem.", group: "INVENTORY" },
+    { code: "APP_NAME", name: "App Name", description: "Nazwa aplikacji mobilnej.", group: "INVENTORY" },
+    { code: "APP_ID", name: "App ID", description: "ID/bundle aplikacji mobilnej.", group: "INVENTORY" },
+    { code: "SUPPLY_SOURCE", name: "Supply Source", description: "Źródło supply (SSP/giełda, np. Google, Pubmatic).", group: "INVENTORY" },
+];
 // ── Dozwolone wartości (z OpenAPI enum) ──────────────────────────────────────
 const DIMENSION_CODES = [
     "DATE", "WEEK", "MONTH", "YEAR",
@@ -206,19 +366,28 @@ const ReportRequestSchema = {
     dimensions: z
         .array(z.enum(DIMENSION_CODES))
         .min(1)
-        .describe("Lista wymiarów raportu (min. 1)"),
+        .describe("Lista wymiarów raportu (min. 1). Użyj list_dimensions żeby poznać dostępne opcje."),
     metrics: z
         .array(z.enum(METRIC_CODES))
         .optional()
-        .describe("Lista metryk raportu (opcjonalna)"),
+        .describe("Lista metryk raportu (opcjonalna). Użyj list_metrics żeby poznać dostępne opcje."),
+    period: z
+        .enum(PERIOD_CODES)
+        .optional()
+        .describe("Skrót okresu — alternatywa dla start_date/end_date. " +
+        "Wartości: today, yesterday, last_7_days, last_30_days, this_month, last_month, " +
+        "this_quarter, last_quarter, this_year, last_year. " +
+        "Podaj period LUB (start_date + end_date)."),
     start_date: z
         .string()
         .regex(/^\d{4}-\d{2}-\d{2}$/, "Format YYYY-MM-DD")
-        .describe("Data początku okresu (YYYY-MM-DD, max 185 dni wstecz)"),
+        .optional()
+        .describe("Data początku okresu (YYYY-MM-DD, max 185 dni wstecz). Wymagane jeśli nie podano 'period'."),
     end_date: z
         .string()
         .regex(/^\d{4}-\d{2}-\d{2}$/, "Format YYYY-MM-DD")
-        .describe("Data końca okresu (YYYY-MM-DD, >= start_date)"),
+        .optional()
+        .describe("Data końca okresu (YYYY-MM-DD, >= start_date). Wymagane jeśli nie podano 'period'."),
     filters: z
         .array(FilterSchema)
         .optional()
@@ -227,12 +396,25 @@ const ReportRequestSchema = {
         .string()
         .optional()
         .describe("Nazwa advertisera (lub jej fragment) — MCP automatycznie zamieni ją na ADVERTISER_UUID i doda do filters. " +
-        "Alternatywa dla ręcznego podawania UUID. Przy niejednoznacznym dopasowaniu zwróci błąd z listą kandydatów."),
+        "Użyj list_advertisers żeby zobaczyć dostępne nazwy. Przy niejednoznacznym dopasowaniu zwróci błąd z listą kandydatów."),
     adlook_token: z
         .string()
         .min(1)
         .optional()
         .describe("Opcjonalny token Bearer do Adlook API. Jeśli nie podasz, użyty będzie ADLOOK_TOKEN z env."),
+};
+// ── Schemat filtrów po nazwie (tylko dla narzędzi z post-processingiem) ───────
+const NameFilterSchema = {
+    campaign_name: z
+        .string()
+        .optional()
+        .describe("Filtruj wyniki po nazwie kampanii (fragment, case-insensitive regexp). " +
+        "Wymaga CAMPAIGN_NAME w dimensions. Automatycznie dodaje regexp do result_filters."),
+    line_item_name: z
+        .string()
+        .optional()
+        .describe("Filtruj wyniki po nazwie line item (fragment, case-insensitive regexp). " +
+        "Wymaga LINE_ITEM_NAME w dimensions. Automatycznie dodaje regexp do result_filters."),
 };
 const filterLeafSchema = z.object({
     column: z.string().describe("Nazwa kolumny"),
@@ -305,8 +487,8 @@ const PostProcessingSchema = {
         "Wyklucza: aggregate, summarize, sort, top, columns."),
     output_format: z
         .optional(z.enum(["json", "columnar", "csv"]))
-        .describe('Format serializacji wyników: "json" (domyślny, tablica obiektów), ' +
-        '"columnar" (nagłówki raz + tablica tablic — ~50% mniej tokenów), ' +
+        .describe('Format serializacji wyników: "columnar" (domyślny, nagłówki raz + tablica tablic — ~50% mniej tokenów), ' +
+        '"json" (tablica obiektów — czytelniejszy dla małych zbiorów), ' +
         '"csv" (string CSV). Nie dotyczy trybów summarize/distinct.'),
 };
 // ── Pomocniki HTTP ────────────────────────────────────────────────────────────
@@ -653,7 +835,7 @@ function runPostProcessing(preview, args) {
         sorted: false,
         limited: false,
         projected: false,
-        output_format: args.output_format ?? "json",
+        output_format: args.output_format ?? "columnar",
     };
     // 1. Filter
     if (args.result_filters) {
@@ -781,10 +963,12 @@ function createServer() {
     server.tool("create_report_preview", "Tworzy asynchroniczne zadanie generowania podglądu raportu (POST /api/custom-reports/previews). " +
         "Zwraca UUID zadania. Wynik należy pobrać narzędziem get_report_preview lub run_report_preview.", ReportRequestSchema, async (args) => {
         try {
-            const { adlook_token, advertiser_name, ...reportArgs } = args;
+            const { adlook_token, advertiser_name, period, start_date, end_date, ...reportArgs } = args;
+            const dates = resolveDateRange(start_date, end_date, period);
+            Object.assign(reportArgs, dates);
             if (advertiser_name) {
                 const uuid = await resolveAdvertiserName(advertiser_name, adlook_token);
-                reportArgs.filters = [...(reportArgs.filters ?? []), { field: "ADVERTISER_UUID", value: [uuid] }];
+                reportArgs["filters"] = [...(reportArgs["filters"] ?? []), { field: "ADVERTISER_UUID", value: [uuid] }];
             }
             const result = await apiPost("/custom-reports/previews", reportArgs, adlook_token);
             return {
@@ -816,8 +1000,21 @@ function createServer() {
             .min(1)
             .optional()
             .describe("Opcjonalny token Bearer do Adlook API. Jeśli nie podasz, użyty będzie ADLOOK_TOKEN z env."),
+        ...NameFilterSchema,
         ...PostProcessingSchema,
-    }, async ({ uuid, adlook_token, ...ppArgs }) => {
+    }, async ({ uuid, adlook_token, campaign_name, line_item_name, ...ppArgs }) => {
+        // Merge campaign/line_item name filters into result_filters
+        const nameConditions = [];
+        if (campaign_name)
+            nameConditions.push({ column: "CAMPAIGN_NAME", regexp: campaign_name });
+        if (line_item_name)
+            nameConditions.push({ column: "LINE_ITEM_NAME", regexp: line_item_name });
+        if (nameConditions.length > 0) {
+            const combined = nameConditions.length === 1 ? nameConditions[0] : { and: nameConditions };
+            ppArgs.result_filters = ppArgs.result_filters
+                ? { and: [ppArgs.result_filters, combined] }
+                : combined;
+        }
         try {
             const validationError = validatePostProcessing(ppArgs);
             if (validationError) {
@@ -842,17 +1039,37 @@ function createServer() {
         }
     });
     // ── Narzędzie 3: run_report_preview ──────────────────────────────────────────
-    server.tool("run_report_preview", "Tworzy zadanie raportu (POST), czeka na jego zakończenie (polling GET) i zwraca wynik. " +
-        "Obsługuje pełny post-processing po stronie MCP: filtrowanie (result_filters), " +
-        "agregację (group_by + aggregate), sortowanie (sort), limitowanie (top), " +
-        "projekcję kolumn (columns), statystyki opisowe (summarize), " +
-        "unikalne wartości (distinct) i format wyjściowy (output_format).", { ...ReportRequestSchema, ...PostProcessingSchema }, async (reportArgs) => {
+    server.tool("run_report_preview", "Tworzy zadanie raportu (POST), czeka na zakończenie (polling) i zwraca wynik z pełnym post-processingiem. " +
+        "UŻYJ TEGO narzędzia jako domyślnego do pobierania danych — łączy create + poll + przetwarzanie w jednym wywołaniu.\n\n" +
+        "Post-processing: result_filters (filtrowanie), sort (sortowanie), top (limit N wierszy), " +
+        "group_by+aggregate (agregacja), columns (projekcja), summarize (statystyki opisowe), " +
+        "distinct (unikalne wartości), output_format (format wyjścia, domyślnie columnar).\n\n" +
+        "Wskazówka: przy nieznanych danych użyj summarize:true najpierw, żeby ocenić skalę przed pobraniem pełnych wyników.\n\n" +
+        "Przykłady:\n" +
+        "• Top 10 domen wg impresji: dimensions:[DOMAIN], metrics:[IMPRESSIONS], sort:{column:IMPRESSIONS,direction:DESC}, top:10\n" +
+        "• Wydatki per kampania w ub. miesiącu: dimensions:[CAMPAIGN_NAME], metrics:[TOTAL_SPEND_USD], period:last_month\n" +
+        "• Viewability per advertiser: dimensions:[ADVERTISER_NAME], metrics:[VIEWABILITY,IMPRESSIONS], sort:{column:IMPRESSIONS,direction:DESC}\n" +
+        "• CTR po device type: dimensions:[DEVICE_TYPE], metrics:[CLICKS,IMPRESSIONS,CLICK_THROUGH_RATE]\n" +
+        "• Kampanie danego advertisera: advertiser_name:'Play', dimensions:[CAMPAIGN_NAME], metrics:[IMPRESSIONS], period:last_month", { ...ReportRequestSchema, ...NameFilterSchema, ...PostProcessingSchema }, async (reportArgs) => {
         try {
-            const { adlook_token, advertiser_name, result_filters, sort, top, columns, group_by, aggregate, summarize, distinct, output_format, ...createArgs } = reportArgs;
-            const ppArgs = { result_filters, sort, top, columns, group_by, aggregate, summarize, distinct, output_format };
+            const { adlook_token, advertiser_name, campaign_name, line_item_name, period, start_date, end_date, result_filters, sort, top, columns, group_by, aggregate, summarize, distinct, output_format, ...createArgs } = reportArgs;
+            let ppResultFilters = result_filters;
+            // Resolve name filters → result_filters
+            const nameConditions = [];
+            if (campaign_name)
+                nameConditions.push({ column: "CAMPAIGN_NAME", regexp: campaign_name });
+            if (line_item_name)
+                nameConditions.push({ column: "LINE_ITEM_NAME", regexp: line_item_name });
+            if (nameConditions.length > 0) {
+                const combined = nameConditions.length === 1 ? nameConditions[0] : { and: nameConditions };
+                ppResultFilters = ppResultFilters ? { and: [ppResultFilters, combined] } : combined;
+            }
+            const ppArgs = { result_filters: ppResultFilters, sort, top, columns, group_by, aggregate, summarize, distinct, output_format };
+            const dates = resolveDateRange(start_date, end_date, period);
+            Object.assign(createArgs, dates);
             if (advertiser_name) {
                 const uuid = await resolveAdvertiserName(advertiser_name, adlook_token);
-                createArgs.filters = [...(createArgs.filters ?? []), { field: "ADVERTISER_UUID", value: [uuid] }];
+                createArgs["filters"] = [...(createArgs["filters"] ?? []), { field: "ADVERTISER_UUID", value: [uuid] }];
             }
             const validationError = validatePostProcessing(ppArgs);
             if (validationError) {
@@ -922,6 +1139,103 @@ function createServer() {
                 },
             ],
         };
+    });
+    // ── Narzędzie: list_dimensions ────────────────────────────────────────────────
+    server.tool("list_dimensions", "Zwraca listę dostępnych wymiarów raportu z opisami i grupami. " +
+        "Używaj gdy nie wiesz jakiego wymiaru użyć do konkretnego pytania analitycznego. " +
+        "Grupy: TIME, GEO, DEVICE, ADVERTISER, CAMPAIGN, LINE_ITEM, CREATIVE, INVENTORY.", {
+        group: z
+            .enum(["TIME", "GEO", "DEVICE", "ADVERTISER", "CAMPAIGN", "LINE_ITEM", "CREATIVE", "INVENTORY"])
+            .optional()
+            .describe("Opcjonalne filtrowanie po grupie wymiarów"),
+        search: z
+            .string()
+            .optional()
+            .describe("Opcjonalne wyszukiwanie po nazwie, kodzie lub opisie (case-insensitive)"),
+    }, async ({ group, search }) => {
+        let results = DIMENSIONS_CATALOG;
+        if (group)
+            results = results.filter((d) => d.group === group);
+        if (search) {
+            const q = search.toLowerCase();
+            results = results.filter((d) => d.code.toLowerCase().includes(q) || d.name.toLowerCase().includes(q) || d.description.toLowerCase().includes(q));
+        }
+        const grouped = results.reduce((acc, d) => {
+            (acc[d.group] ??= []).push(d);
+            return acc;
+        }, {});
+        const output = Object.entries(grouped)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([grp, dims]) => ({ group: grp, dimensions: dims.map((d) => ({ code: d.code, name: d.name, description: d.description })) }));
+        return { content: [{ type: "text", text: JSON.stringify({ total: results.length, groups: output }, null, 2) }] };
+    });
+    // ── Narzędzie: list_advertisers ───────────────────────────────────────────────
+    server.tool("list_advertisers", "Zwraca listę dostępnych advertiserów (nazwa + UUID). " +
+        "Używaj przed run_report_preview, żeby znaleźć dokładną nazwę do parametru advertiser_name. " +
+        "Wyniki są cache'owane przez 1 godzinę (budowane z danych z ostatnich 90 dni).", {
+        search: z.string().optional().describe("Opcjonalne filtrowanie po fragmencie nazwy (case-insensitive)"),
+        adlook_token: z.string().min(1).optional().describe("Opcjonalny token Bearer do Adlook API"),
+    }, async ({ search, adlook_token }) => {
+        try {
+            const cache = await getAdvertiserCache(adlook_token);
+            let entries = Array.from(cache.entries())
+                .map(([name, uuid]) => ({ name, uuid }))
+                .sort((a, b) => a.name.localeCompare(b.name));
+            if (search) {
+                const q = search.toLowerCase();
+                entries = entries.filter((e) => e.name.includes(q));
+            }
+            return {
+                content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            total: entries.length,
+                            advertisers: entries,
+                            note: "Lista pochodzi z ostatnich 90 dni aktywności. Cache odświeżany co 1h.",
+                        }, null, 2),
+                    }],
+            };
+        }
+        catch (err) {
+            return { content: [{ type: "text", text: `Błąd: ${err.message}` }], isError: true };
+        }
+    });
+    // ── Narzędzie: check_auth ─────────────────────────────────────────────────────
+    server.tool("check_auth", "Sprawdza status autoryzacji — czy token jest ustawiony i kiedy wygasa. " +
+        "Nie wykonuje zapytania do API, tylko dekoduje JWT lokalnie. " +
+        "Wywołaj na początku sesji lub gdy inne narzędzia zgłaszają błędy 401.", {
+        adlook_token: z.string().min(1).optional()
+            .describe("Opcjonalny token do sprawdzenia; jeśli nie podasz, sprawdza token sesji / ADLOOK_TOKEN z env."),
+    }, async ({ adlook_token }) => {
+        try {
+            const token = await resolveAccessToken(adlook_token);
+            const parts = token.split(".");
+            if (parts.length !== 3) {
+                return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Token nie wygląda jak JWT (oczekiwane 3 segmenty base64)." }) }], isError: true };
+            }
+            const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf-8"));
+            const now = Math.floor(Date.now() / 1000);
+            const exp = payload.exp;
+            const expired = exp !== undefined ? exp < now : false;
+            return {
+                content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            ok: !expired,
+                            expired,
+                            expires_at: exp ? new Date(exp * 1000).toISOString() : null,
+                            expires_in_seconds: exp ? exp - now : null,
+                            user_uuid: payload.user_uuid ?? null,
+                            permissions: payload.permissions ?? null,
+                            auto_refresh: isOAuthRefreshConfigured(),
+                        }, null, 2),
+                    }],
+                ...(expired ? { isError: true } : {}),
+            };
+        }
+        catch (err) {
+            return { content: [{ type: "text", text: `Błąd: ${err.message}` }], isError: true };
+        }
     });
     // ── Zasób MCP: katalog metryk ─────────────────────────────────────────────────
     server.resource("metrics-catalog", "adlook://metrics-catalog", {
